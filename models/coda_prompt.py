@@ -135,6 +135,15 @@ class Learner(BaseLearner):
                         inputs, train=True, return_features=True
                     )
                     cfeatures = features.detach()
+                    
+                    # 【改进】先计算初始损失用于困难样本感知
+                    with torch.no_grad():
+                        logits_masked = logits[:, :self._total_classes].clone()
+                        logits_masked[:, :self._known_classes] = float('-inf')
+                        init_losses = F.cross_entropy(logits_masked, targets.long(), reduction='none')
+                    
+                    # 传递损失值给权重学习器
+                    self.reweight_cfg["total_epochs"] = self.args['tuned_epoch']
                     weight1, self._reweight_state = coda_weight_learner(
                         cfeatures,
                         self._reweight_state,
@@ -142,6 +151,8 @@ class Learner(BaseLearner):
                         global_epoch=epoch,
                         inner_iter=i,
                         cur_task=self._cur_task,
+                        sample_losses=init_losses,
+                        targets=targets,
                     )
                 else:
                     logits, prompt_loss = self._network(inputs, train=True)
@@ -165,7 +176,7 @@ class Learner(BaseLearner):
                         # Softmax 归一化：权重和为1，使用加权求和
                         loss_cls = torch.sum(base_loss * weight_squeeze)
                     
-                    # 可选：对 prompt_loss 也进行加权（默认不加权）
+                    # prompt_loss 权重
                     prompt_weight = float(self.reweight_cfg.get("prompt_loss_weight", 1.0))
                     loss = loss_cls + prompt_weight * prompt_loss.sum()
                 else:
@@ -336,7 +347,8 @@ class SampleReweightState:
                 self.weights[end:bsz] = new_weights[end:bsz]
                 self.valid = bsz
 
-def coda_weight_learner(cfeatures, state, cfg, global_epoch=0, inner_iter=0, cur_task=0):
+def coda_weight_learner(cfeatures, state, cfg, global_epoch=0, inner_iter=0, cur_task=0, 
+                        sample_losses=None, targets=None):
     """
     改进的权重学习器，专门适配 CODA-Prompt 的持续学习场景。
     
@@ -345,6 +357,8 @@ def coda_weight_learner(cfeatures, state, cfg, global_epoch=0, inner_iter=0, cur
     2. 添加温度参数控制权重分布的平滑度
     3. 引入任务感知的正则化强度
     4. 改进特征池化策略，考虑特征多样性
+    5. 【新增】困难样本感知：根据损失值调整初始权重
+    6. 【新增】渐进式权重强度：训练早期权重差异小，后期逐步增大
     """
     bsz = cfeatures.size(0)
     device = cfeatures.device
@@ -353,8 +367,20 @@ def coda_weight_learner(cfeatures, state, cfg, global_epoch=0, inner_iter=0, cur
     prev_feat = state.features[:state.valid] if state.valid > 0 else torch.empty(0, cfeatures.size(1), device=device)
     prev_w = state.weights[:state.valid] if state.valid > 0 else torch.empty(0, 1, device=device)
     
-    # 初始化权重参数（使用零初始化，配合 softplus 输出约为 0.693）
-    weight = Variable(torch.zeros(bsz, 1, device=device))
+    # 【改进】基于损失值的初始化：困难样本获得更高初始权重
+    if sample_losses is not None and cfg.get("loss_aware_init", True):
+        # 将损失值转换为初始权重偏置
+        loss_weights = sample_losses.detach().view(-1, 1)
+        # 归一化到合理范围
+        loss_weights = (loss_weights - loss_weights.mean()) / (loss_weights.std() + 1e-8)
+        # 缩放因子：控制损失对初始权重的影响程度
+        loss_scale = cfg.get("loss_init_scale", 0.1)
+        init_bias = loss_weights * loss_scale
+    else:
+        init_bias = torch.zeros(bsz, 1, device=device)
+    
+    # 初始化权重参数
+    weight = Variable(init_bias.clone())
     weight.requires_grad = True
     
     # 特征池化：对当前特征做 L2 归一化，提高协方差计算的稳定性
@@ -370,16 +396,22 @@ def coda_weight_learner(cfeatures, state, cfg, global_epoch=0, inner_iter=0, cur
     optimizer_bl = torch.optim.SGD([weight], lr=base_lr * task_decay, momentum=cfg.get("momentum", 0.9))
     
     inner_epochs = max(1, cfg.get("inner_epochs", 5))
-    norm_mode = cfg.get("norm", "softplus").lower()  # "softmax" | "sigmoid_mean" | "softplus"
-    clamp_ratio = float(cfg.get("clamp_ratio", 2.0))
+    norm_mode = cfg.get("norm", "softplus").lower()
+    base_clamp_ratio = float(cfg.get("clamp_ratio", 2.0))
     temperature = float(cfg.get("temperature", 1.0))
+    
+    # 【改进】渐进式权重范围：训练早期权重差异小，后期逐步增大
+    total_epochs = cfg.get("total_epochs", 20)
+    epoch_progress = min(1.0, (global_epoch + 1) / max(1, total_epochs))
+    # clamp_ratio 从接近1逐步增大到目标值
+    min_clamp = cfg.get("min_clamp_ratio", 1.2)
+    clamp_ratio = min_clamp + (base_clamp_ratio - min_clamp) * epoch_progress
 
     for inner_epoch in range(inner_epochs):
         _set_balance_lr(optimizer_bl, inner_epoch, cfg, inner_epochs)
         optimizer_bl.zero_grad()
 
         if norm_mode == "softplus":
-            # Softplus 归一化：输出非负，梯度不饱和
             cur_weight = F.softplus(weight / temperature)
             cur_weight = cur_weight / (cur_weight.mean().detach() + 1e-8)
             if clamp_ratio > 1.0:
@@ -404,7 +436,6 @@ def coda_weight_learner(cfeatures, state, cfg, global_epoch=0, inner_iter=0, cur
                 pooled_weight = torch.clamp(pooled_weight, 1.0 / clamp_ratio, clamp_ratio)
                 pooled_weight = pooled_weight / (pooled_weight.mean().detach() + 1e-8)
         else:
-            # Softmax 归一化（原版）
             softmax = nn.Softmax(dim=0)
             cur_weight = softmax(weight / temperature)
             pooled_weight = softmax(weight_pool / temperature)
@@ -412,22 +443,19 @@ def coda_weight_learner(cfeatures, state, cfg, global_epoch=0, inner_iter=0, cur
         # 计算去相关损失
         loss_b = lossb_expect(feature_pool, pooled_weight, num_f=cfg.get("num_fourier", 1), use_sum=cfg.get("use_sum", True))
         
-        # 正则化损失：根据归一化模式调整
+        # 正则化损失
         decay_pow = cfg.get("decay_pow", 2.0)
         if norm_mode in ["sigmoid_mean", "softplus"]:
-            # 让权重趋向于1，而非趋向于0
             loss_p = torch.sum((cur_weight - 1.0).pow(decay_pow))
         else:
             loss_p = torch.sum(cur_weight.pow(decay_pow))
 
-        # Lambda 缩放：考虑任务进度
+        # Lambda 缩放
         lambda_coef = cfg.get("lambda_coef", 70.0)
         decay_factor = cfg.get("lambda_decay_rate", 1.0) ** (global_epoch // max(1, cfg.get("lambda_decay_epoch", 5)))
-        # 任务越多，去相关约束越弱（保持可塑性）
         task_lambda_scale = cfg.get("task_lambda_scale", 1.0) ** cur_task
         lambda_scaled = max(cfg.get("min_lambda", 0.01), decay_factor) * lambda_coef * task_lambda_scale
         
-        # 正则化权重：随任务增加而减弱
         reg_weight = cfg.get("reg_weight", 0.1) * (cfg.get("reg_task_decay", 0.9) ** cur_task)
         
         loss_g = loss_b / lambda_scaled + reg_weight * loss_p
@@ -455,7 +483,7 @@ def coda_weight_learner(cfeatures, state, cfg, global_epoch=0, inner_iter=0, cur
         else:
             final_weight = nn.Softmax(dim=0)(weight / temperature)
 
-    # 更新特征库（使用原始特征，非归一化版本）
+    # 更新特征库
     state.update_bank(cfeatures.detach(), final_weight.detach())
     if global_epoch == 0 and inner_iter < cfg.get("bootstrap_iters", 10):
         state.features[:bsz] = (state.features[:bsz] * inner_iter + cfeatures.detach()) / (inner_iter + 1)

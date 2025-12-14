@@ -651,26 +651,32 @@ class CodaPromptVitNet(nn.Module):
         self.args = args
         self.backbone = get_backbone(args, pretrained)
         self.fc = nn.Linear(768, args["nb_classes"])
+        self.feature_dim = 768
         self.prompt = CodaPrompt(768, args["nb_tasks"], args["prompt_param"])
 
     # pen: get penultimate features  
-    def forward(self, x, pen=False, train=False):
+    def forward(self, x, train=False, return_features=False):
+        device = x.device
+        prompt_loss = torch.zeros(1, device=device)
         if self.prompt is not None:
             with torch.no_grad():
                 q, _ = self.backbone(x)
-                q = q[:,0,:]
-            out, prompt_loss = self.backbone(x, prompt=self.prompt, q=q, train=train)
-            out = out[:,0,:]
+                q = q[:, 0, :]
+            res, prompt_loss = self.backbone(x, prompt=self.prompt, q=q, train=train)
         else:
-            out, _ = self.backbone(x)
-            out = out[:,0,:]
-        out = out.view(out.size(0), -1)
-        if not pen:
-            out = self.fc(out)
-        if self.prompt is not None and train:
-            return out, prompt_loss
+            res, prompt_loss = self.backbone(x)
+        if not isinstance(prompt_loss, torch.Tensor):
+            prompt_loss = torch.as_tensor(prompt_loss, device=device).view(1)
+        if isinstance(res, dict):
+            cls_tokens = res.get('x', res.get('features'))
+            if isinstance(cls_tokens, torch.Tensor) and cls_tokens.dim() == 3:
+                cls_tokens = cls_tokens[:, 0, :]
         else:
-            return out
+            cls_tokens = res[:, 0, :]
+        logits = self.fc(cls_tokens)
+        if return_features:
+            return logits, prompt_loss, cls_tokens
+        return logits, prompt_loss
 
 
 class MultiBranchCosineIncrementalNet(BaseNet):

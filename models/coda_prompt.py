@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader
 from utils.inc_net import CodaPromptVitNet
 from models.base import BaseLearner
 from utils.toolkit import tensor2numpy
+from torch.autograd import Variable
 
 # tune the model at first session with vpt, and then conduct simple shot.
 num_workers = 8
@@ -26,6 +27,14 @@ class Learner(BaseLearner):
         self.weight_decay = args["weight_decay"] if args["weight_decay"] is not None else 0.0005
         self.min_lr = args["min_lr"] if args["min_lr"] is not None else 1e-8
         self.args = args
+        self.reweight_cfg = args.get("reweighting", {})
+        self.reweight_enabled = self.reweight_cfg.get("enabled", False)
+        if self.reweight_enabled:
+            buffer_size = self.reweight_cfg.get("buffer_size", 1024)
+            feature_dim = self.reweight_cfg.get("feature_dim", self._network.feature_dim)
+            self._reweight_state = SampleReweightState(buffer_size, feature_dim,
+                                                       self.reweight_cfg.get("presave_ratio", 0.9),
+                                                       device=self._device)
         
         total_params = sum(p.numel() for p in self._network.parameters())
         logging.info(f'{total_params:,} total parameters.')
@@ -67,6 +76,8 @@ class Learner(BaseLearner):
 
     def _train(self, train_loader, test_loader):
         self._network.to(self._device)
+        if self.reweight_enabled:
+            self._reweight_state.to_(self._device)
 
         optimizer = self.get_optimizer()
         scheduler = self.get_scheduler(optimizer)
@@ -111,17 +122,29 @@ class Learner(BaseLearner):
             correct, total = 0, 0
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self._device), targets.to(self._device)
-            
-                # logits
-                logits, prompt_loss = self._network(inputs, train=True)
+                warmup_epochs = int(self.reweight_cfg.get("warmup_epochs", 0)) if self.reweight_enabled else 0
+                if self.reweight_enabled and epoch >= warmup_epochs:
+                    logits, prompt_loss, features = self._network(
+                        inputs, train=True, return_features=True
+                    )
+                    cfeatures = features.detach()
+                    weight1, self._reweight_state = coda_weight_learner(
+                        cfeatures,
+                        self._reweight_state,
+                        self.reweight_cfg,
+                        global_epoch=epoch,
+                        inner_iter=i,
+                    )
+                else:
+                    logits, prompt_loss = self._network(inputs, train=True)
+                    weight1 = torch.ones(inputs.size(0), 1, device=self._device)
                 logits = logits[:, :self._total_classes]
 
                 logits[:, :self._known_classes] = float('-inf')
-                dw_cls = self.dw_k[-1 * torch.ones(targets.size()).long()]
-                loss_supervised = (F.cross_entropy(logits, targets.long()) * dw_cls).mean()
-
-                # ce loss
-                loss = loss_supervised + prompt_loss.sum()
+                base_loss = F.cross_entropy(logits, targets.long(), reduction='none')
+                # 注意：weight1 是按 batch Softmax 归一化过的，sum(weight1)=1，此时应做加权求和而非再次 mean
+                loss_cls = torch.sum(base_loss * weight1.squeeze(1))
+                loss = loss_cls + prompt_loss.sum()
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -165,12 +188,17 @@ class Learner(BaseLearner):
         for _, (_, inputs, targets) in enumerate(loader):
             inputs = inputs.to(self._device)
             with torch.no_grad():
-                outputs = self._network(inputs)[:, :self._total_classes]
+                outputs = self._network(inputs)
+                if isinstance(outputs, tuple):
+                    logits = outputs[0]
+                elif isinstance(outputs, dict):
+                    logits = outputs.get("logits", outputs.get("output"))
+                else:
+                    logits = outputs
+                logits = logits[:, :self._total_classes]
             predicts = torch.topk(
-                outputs, k=self.topk, dim=1, largest=True, sorted=True
-            )[
-                1
-            ]  # [bs, topk]
+                logits, k=self.topk, dim=1, largest=True, sorted=True
+            )[1]
             y_pred.append(predicts.cpu().numpy())
             y_true.append(targets.cpu().numpy())
 
@@ -180,10 +208,17 @@ class Learner(BaseLearner):
         model.eval()
         correct, total = 0, 0
         for i, (_, inputs, targets) in enumerate(loader):
-            inputs = inputs.to(self._device)
+            inputs = inputs.to (self._device)
             with torch.no_grad():
-                outputs = model(inputs)[:, :self._total_classes]
-            predicts = torch.max(outputs, dim=1)[1]
+                outputs = model(inputs)
+                if isinstance(outputs, tuple):
+                    logits = outputs[0]
+                elif isinstance(outputs, dict):
+                    logits = outputs.get("logits", outputs.get("output"))
+                else:
+                    logits = outputs
+                logits = logits[:, :self._total_classes]
+            predicts = torch.max(logits, dim=1)[1]
             correct += (predicts.cpu() == targets).sum()
             total += len(targets)
 
@@ -244,3 +279,118 @@ class CosineSchedule(_LRScheduler):
 
     def get_lr(self):
         return [self.cosine(base_lr) for base_lr in self.base_lrs]
+
+class SampleReweightState:
+    def __init__(self, buffer_size, feature_dim, presave_ratio=0.9, device="cpu"):
+        self.features = torch.zeros(buffer_size, feature_dim, device=device)
+        self.weights = torch.ones(buffer_size, 1, device=device)
+        self.valid = 0
+        self.presave_ratio = presave_ratio
+
+    def to_(self, device):
+        self.features = self.features.to(device)
+        self.weights = self.weights.to(device)
+        return self
+
+    def update_bank(self, new_features, new_weights):
+        bsz = new_features.size(0)
+        if self.features.size(0) < bsz:
+            self.features = torch.zeros_like(new_features)
+            self.weights = torch.ones(bsz, 1, device=new_weights.device)
+        ratio = self.presave_ratio
+        if self.valid == 0:
+            self.features[:bsz] = new_features
+            self.weights[:bsz] = new_weights
+            self.valid = bsz
+        else:
+            end = min(self.valid, bsz)
+            self.features[:end] = ratio * self.features[:end] + (1 - ratio) * new_features[:end]
+            self.weights[:end] = ratio * self.weights[:end] + (1 - ratio) * new_weights[:end]
+            if bsz > end:
+                self.features[end:bsz] = new_features[end:bsz]
+                self.weights[end:bsz] = new_weights[end:bsz]
+                self.valid = bsz
+
+def coda_weight_learner(cfeatures, state, cfg, global_epoch=0, inner_iter=0):
+    bsz = cfeatures.size(0)
+    device = cfeatures.device
+    prev_feat = state.features[:state.valid] if state.valid > 0 else torch.empty(0, cfeatures.size(1), device=device)
+    prev_w = state.weights[:state.valid] if state.valid > 0 else torch.empty(0, 1, device=device)
+    weight = Variable(torch.ones(bsz, 1, device=device))
+    weight.requires_grad = True
+    feature_pool = torch.cat([cfeatures, prev_feat.detach()], dim=0)
+    weight_pool = torch.cat([weight, prev_w.detach()], dim=0) if prev_w.numel() else weight
+    optimizer_bl = torch.optim.SGD([weight],
+                                   lr=cfg.get("lr", 0.1),
+                                   momentum=cfg.get("momentum", 0.9))
+    inner_epochs = max(1, cfg.get("inner_epochs", 5))
+    for inner_epoch in range(inner_epochs):
+        _set_balance_lr(optimizer_bl, inner_epoch, cfg, inner_epochs)
+        optimizer_bl.zero_grad()
+        softmax = nn.Softmax(dim=0)
+        cur_weight = softmax(weight)
+        pooled_weight = softmax(weight_pool)
+        loss_b = lossb_expect(feature_pool, pooled_weight,
+                              num_f=cfg.get("num_fourier", 1),
+                              use_sum=cfg.get("use_sum", True))
+        loss_p = torch.sum(cur_weight.pow(cfg.get("decay_pow", 2.0)))
+        lambda_coef = cfg.get("lambda_coef", 70.0)
+        decay = cfg.get("lambda_decay_rate", 1.0) ** (global_epoch // max(1, cfg.get("lambda_decay_epoch", 5)))
+        lambda_scaled = max(cfg.get("min_lambda", 0.01), decay) * lambda_coef
+        loss_g = loss_b / lambda_scaled + loss_p
+        if global_epoch == 0:
+            loss_g = loss_g * cfg.get("first_step_cons", 1.0)
+        loss_g.backward(retain_graph=True)
+        optimizer_bl.step()
+        weight_pool = torch.cat([weight, prev_w.detach()], dim=0) if prev_w.numel() else weight
+    softmax_weight = nn.Softmax(dim=0)(weight.detach())
+    state.update_bank(cfeatures.detach(), softmax_weight.detach())
+    if global_epoch == 0 and inner_iter < cfg.get("bootstrap_iters", 10):
+        state.features[:bsz] = (state.features[:bsz] * inner_iter + cfeatures.detach()) / (inner_iter + 1)
+        state.weights[:bsz] = (state.weights[:bsz] * inner_iter + softmax_weight.detach()) / (inner_iter + 1)
+        state.valid = max(state.valid, bsz)
+    return softmax_weight, state
+
+def _set_balance_lr(optimizer, epoch, cfg, total_epochs):
+    base_lr = cfg.get("lr", 0.1)
+    step = max(1, int(total_epochs * 0.5))
+    decay = (epoch // step)
+    lr = base_lr * (0.1 ** decay)
+    for group in optimizer.param_groups:
+        group["lr"] = lr
+
+def lossb_expect(cfeaturec, weight, num_f=1, use_sum=True):
+    cfeaturecs = random_fourier_features_gpu(cfeaturec, num_f=num_f, use_sum=use_sum)
+    loss = cfeaturec.new_tensor(0.0)
+    for i in range(cfeaturecs.size(-1)):
+        slice_feat = cfeaturecs[:, :, i]
+        cov_matrix = cov(slice_feat, weight)
+        cov_square = cov_matrix * cov_matrix
+        loss = loss + torch.sum(cov_square) - torch.trace(cov_square)
+    return loss
+
+def cov(x, w=None):
+    if w is None or w.numel() == 0:
+        n = x.shape[0]
+        cov_mat = torch.matmul(x.t(), x) / max(1, n)
+        e = torch.mean(x, dim=0).view(-1, 1)
+    else:
+        w = w.view(-1, 1)
+        cov_mat = torch.matmul((w * x).t(), x)
+        e = torch.sum(w * x, dim=0).view(-1, 1)
+    return cov_mat - torch.matmul(e, e.t())
+
+def random_fourier_features_gpu(x, num_f=1, use_sum=True, sigma=None):
+    if sigma is None or sigma == 0:
+        sigma = 1.0
+    n, r = x.size()
+    w = (1 / sigma) * torch.randn(num_f, 1, device=x.device)
+    b = 2 * math.pi * torch.rand(n, r, num_f, device=x.device)
+    mid = torch.matmul(x.view(n, r, 1), w.t()) + b
+    mid = mid - mid.min(dim=1, keepdim=True).values
+    mid = mid / (mid.max(dim=1, keepdim=True).values + 1e-6)
+    mid = mid * (math.pi / 2.0)
+    scale = math.sqrt(2.0 / num_f)
+    if use_sum:
+        return scale * (torch.cos(mid) + torch.sin(mid))
+    return scale * torch.cat([torch.cos(mid), torch.sin(mid)], dim=-1)

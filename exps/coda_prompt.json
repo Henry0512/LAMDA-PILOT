@@ -25,5 +25,25 @@
     "drop": 0.0,
     "drop_path": 0.0,
 
-    "prompt_param": [100, 8.0, 0.0]
+    "prompt_param": [100, 8.0, 0.0],
+
+    "reweighting": {
+        "enabled": true,
+        "buffer_size": 1024,
+        "feature_dim": 768,
+        "inner_epochs": 5,
+        "bootstrap_iters": 10,
+        "lr": 0.1,
+        "momentum": 0.9,
+        "lambda_coef": 70.0,
+        "lambda_decay_rate": 1.0,
+        "lambda_decay_epoch": 5,
+        "min_lambda": 0.01,
+        "presave_ratio": 0.9,
+        "decay_pow": 2.0,
+        "num_fourier": 1,
+        "use_sum": true,
+        "first_step_cons": 1.0,
+        "warmup_epochs": 3
+    }
 }

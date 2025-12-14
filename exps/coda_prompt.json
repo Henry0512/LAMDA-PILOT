@@ -44,6 +44,9 @@
         "num_fourier": 1,
         "use_sum": true,
         "first_step_cons": 1.0,
-        "warmup_epochs": 3
+        "warmup_epochs": 3,
+        "start_task": 1,
+        "norm": "sigmoid_mean",
+        "clamp_ratio": 2.0
     }
 }

@@ -123,7 +123,8 @@ class Learner(BaseLearner):
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self._device), targets.to(self._device)
                 warmup_epochs = int(self.reweight_cfg.get("warmup_epochs", 0)) if self.reweight_enabled else 0
-                if self.reweight_enabled and epoch >= warmup_epochs:
+                start_task = int(self.reweight_cfg.get("start_task", 1)) if self.reweight_enabled else 0
+                if self.reweight_enabled and (self._cur_task >= start_task) and (epoch >= warmup_epochs):
                     logits, prompt_loss, features = self._network(
                         inputs, train=True, return_features=True
                     )
@@ -142,8 +143,14 @@ class Learner(BaseLearner):
 
                 logits[:, :self._known_classes] = float('-inf')
                 base_loss = F.cross_entropy(logits, targets.long(), reduction='none')
-                # 注意：weight1 是按 batch Softmax 归一化过的，sum(weight1)=1，此时应做加权求和而非再次 mean
-                loss_cls = torch.sum(base_loss * weight1.squeeze(1))
+                # 根据权重归一化方式选择合适的缩放：
+                # - softmax: sum(weight)=1 -> 使用加权求和
+                # - sigmoid_mean: mean(weight)=1 -> 使用加权平均
+                norm_mode = (self.reweight_cfg.get("norm", "softmax") if self.reweight_enabled else "none").lower()
+                if norm_mode == "sigmoid_mean":
+                    loss_cls = (base_loss * weight1.squeeze(1)).mean()
+                else:
+                    loss_cls = torch.sum(base_loss * weight1.squeeze(1))
                 loss = loss_cls + prompt_loss.sum()
 
                 optimizer.zero_grad()
@@ -320,36 +327,69 @@ def coda_weight_learner(cfeatures, state, cfg, global_epoch=0, inner_iter=0):
     weight.requires_grad = True
     feature_pool = torch.cat([cfeatures, prev_feat.detach()], dim=0)
     weight_pool = torch.cat([weight, prev_w.detach()], dim=0) if prev_w.numel() else weight
-    optimizer_bl = torch.optim.SGD([weight],
-                                   lr=cfg.get("lr", 0.1),
-                                   momentum=cfg.get("momentum", 0.9))
+    optimizer_bl = torch.optim.SGD([weight], lr=cfg.get("lr", 0.1), momentum=cfg.get("momentum", 0.9))
     inner_epochs = max(1, cfg.get("inner_epochs", 5))
+    norm_mode = cfg.get("norm", "softmax").lower()  # "softmax" | "sigmoid_mean"
+    clamp_ratio = float(cfg.get("clamp_ratio", 0.0))  # >0 生效
+
     for inner_epoch in range(inner_epochs):
         _set_balance_lr(optimizer_bl, inner_epoch, cfg, inner_epochs)
         optimizer_bl.zero_grad()
-        softmax = nn.Softmax(dim=0)
-        cur_weight = softmax(weight)
-        pooled_weight = softmax(weight_pool)
-        loss_b = lossb_expect(feature_pool, pooled_weight,
-                              num_f=cfg.get("num_fourier", 1),
-                              use_sum=cfg.get("use_sum", True))
-        loss_p = torch.sum(cur_weight.pow(cfg.get("decay_pow", 2.0)))
+
+        if norm_mode == "sigmoid_mean":
+            # 非竞争型：Sigmoid 后按均值=1归一化
+            cur_weight = torch.sigmoid(weight)
+            cur_weight = cur_weight / (cur_weight.mean().detach() + 1e-8)
+            if clamp_ratio and clamp_ratio > 1.0:
+                cur_weight = torch.clamp(cur_weight, 1.0 / clamp_ratio, clamp_ratio)
+                cur_weight = cur_weight / (cur_weight.mean().detach() + 1e-8)
+
+            pooled_weight = torch.sigmoid(weight_pool)
+            pooled_weight = pooled_weight / (pooled_weight.mean().detach() + 1e-8)
+            if clamp_ratio and clamp_ratio > 1.0:
+                pooled_weight = torch.clamp(pooled_weight, 1.0 / clamp_ratio, clamp_ratio)
+                pooled_weight = pooled_weight / (pooled_weight.mean().detach() + 1e-8)
+        else:
+            # 竞争型：Softmax，和为1
+            softmax = nn.Softmax(dim=0)
+            cur_weight = softmax(weight)
+            pooled_weight = softmax(weight_pool)
+
+        loss_b = lossb_expect(feature_pool, pooled_weight, num_f=cfg.get("num_fourier", 1), use_sum=cfg.get("use_sum", True))
+        if norm_mode == "sigmoid_mean":
+            # 让权重中心在1附近，抑制过大或过小
+            decay_pow = cfg.get("decay_pow", 2.0)
+            loss_p = torch.sum((cur_weight - 1.0).pow(decay_pow))
+        else:
+            loss_p = torch.sum(cur_weight.pow(cfg.get("decay_pow", 2.0)))
+
         lambda_coef = cfg.get("lambda_coef", 70.0)
-        decay = cfg.get("lambda_decay_rate", 1.0) ** (global_epoch // max(1, cfg.get("lambda_decay_epoch", 5)))
-        lambda_scaled = max(cfg.get("min_lambda", 0.01), decay) * lambda_coef
+        decay_factor = cfg.get("lambda_decay_rate", 1.0) ** (global_epoch // max(1, cfg.get("lambda_decay_epoch", 5)))
+        lambda_scaled = max(cfg.get("min_lambda", 0.01), decay_factor) * lambda_coef
         loss_g = loss_b / lambda_scaled + loss_p
         if global_epoch == 0:
             loss_g = loss_g * cfg.get("first_step_cons", 1.0)
         loss_g.backward(retain_graph=True)
         optimizer_bl.step()
         weight_pool = torch.cat([weight, prev_w.detach()], dim=0) if prev_w.numel() else weight
-    softmax_weight = nn.Softmax(dim=0)(weight.detach())
-    state.update_bank(cfeatures.detach(), softmax_weight.detach())
+
+    # 输出与缓存更新：按选择的归一化模式生成最终权重
+    if norm_mode == "sigmoid_mean":
+        final_weight = torch.sigmoid(weight.detach())
+        final_weight = final_weight / (final_weight.mean() + 1e-8)
+        if clamp_ratio and clamp_ratio > 1.0:
+            final_weight = torch.clamp(final_weight, 1.0 / clamp_ratio, clamp_ratio)
+            final_weight = final_weight / (final_weight.mean() + 1e-8)
+    else:
+        final_weight = nn.Softmax(dim=0)(weight.detach())
+
+    state.update_bank(cfeatures.detach(), final_weight.detach())
     if global_epoch == 0 and inner_iter < cfg.get("bootstrap_iters", 10):
         state.features[:bsz] = (state.features[:bsz] * inner_iter + cfeatures.detach()) / (inner_iter + 1)
-        state.weights[:bsz] = (state.weights[:bsz] * inner_iter + softmax_weight.detach()) / (inner_iter + 1)
+        state.weights[:bsz] = (state.weights[:bsz] * inner_iter + final_weight.detach()) / (inner_iter + 1)
         state.valid = max(state.valid, bsz)
-    return softmax_weight, state
+
+    return final_weight, state
 
 def _set_balance_lr(optimizer, epoch, cfg, total_epochs):
     base_lr = cfg.get("lr", 0.1)

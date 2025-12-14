@@ -123,8 +123,14 @@ class Learner(BaseLearner):
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self._device), targets.to(self._device)
                 warmup_epochs = int(self.reweight_cfg.get("warmup_epochs", 0)) if self.reweight_enabled else 0
-                start_task = int(self.reweight_cfg.get("start_task", 1)) if self.reweight_enabled else 0
-                if self.reweight_enabled and (self._cur_task >= start_task) and (epoch >= warmup_epochs):
+                start_task = int(self.reweight_cfg.get("start_task", 0)) if self.reweight_enabled else 0
+                
+                # 判断是否启用重加权
+                use_reweight = (self.reweight_enabled 
+                               and (self._cur_task >= start_task) 
+                               and (epoch >= warmup_epochs))
+                
+                if use_reweight:
                     logits, prompt_loss, features = self._network(
                         inputs, train=True, return_features=True
                     )
@@ -135,23 +141,35 @@ class Learner(BaseLearner):
                         self.reweight_cfg,
                         global_epoch=epoch,
                         inner_iter=i,
+                        cur_task=self._cur_task,
                     )
                 else:
                     logits, prompt_loss = self._network(inputs, train=True)
                     weight1 = torch.ones(inputs.size(0), 1, device=self._device)
+                
                 logits = logits[:, :self._total_classes]
-
                 logits[:, :self._known_classes] = float('-inf')
+                
+                # 计算分类损失
                 base_loss = F.cross_entropy(logits, targets.long(), reduction='none')
-                # 根据权重归一化方式选择合适的缩放：
-                # - softmax: sum(weight)=1 -> 使用加权求和
-                # - sigmoid_mean: mean(weight)=1 -> 使用加权平均
-                norm_mode = (self.reweight_cfg.get("norm", "softmax") if self.reweight_enabled else "none").lower()
-                if norm_mode == "sigmoid_mean":
-                    loss_cls = (base_loss * weight1.squeeze(1)).mean()
+                
+                # 根据归一化模式和是否启用重加权选择损失计算方式
+                if use_reweight:
+                    norm_mode = self.reweight_cfg.get("norm", "softplus").lower()
+                    weight_squeeze = weight1.squeeze(1)
+                    
+                    if norm_mode in ["sigmoid_mean", "softplus"]:
+                        # 均值归一化：使用加权平均
+                        loss_cls = (base_loss * weight_squeeze).mean()
+                    else:
+                        # Softmax 归一化：权重和为1，使用加权求和
+                        loss_cls = torch.sum(base_loss * weight_squeeze)
+                    
+                    # 可选：对 prompt_loss 也进行加权（默认不加权）
+                    prompt_weight = float(self.reweight_cfg.get("prompt_loss_weight", 1.0))
+                    loss = loss_cls + prompt_weight * prompt_loss.sum()
                 else:
-                    loss_cls = torch.sum(base_loss * weight1.squeeze(1))
-                loss = loss_cls + prompt_loss.sum()
+                    loss = base_loss.mean() + prompt_loss.sum()
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -318,71 +336,126 @@ class SampleReweightState:
                 self.weights[end:bsz] = new_weights[end:bsz]
                 self.valid = bsz
 
-def coda_weight_learner(cfeatures, state, cfg, global_epoch=0, inner_iter=0):
+def coda_weight_learner(cfeatures, state, cfg, global_epoch=0, inner_iter=0, cur_task=0):
+    """
+    改进的权重学习器，专门适配 CODA-Prompt 的持续学习场景。
+    
+    核心改进：
+    1. 使用 softplus 替代 sigmoid，避免梯度饱和
+    2. 添加温度参数控制权重分布的平滑度
+    3. 引入任务感知的正则化强度
+    4. 改进特征池化策略，考虑特征多样性
+    """
     bsz = cfeatures.size(0)
     device = cfeatures.device
+    
+    # 获取历史特征和权重
     prev_feat = state.features[:state.valid] if state.valid > 0 else torch.empty(0, cfeatures.size(1), device=device)
     prev_w = state.weights[:state.valid] if state.valid > 0 else torch.empty(0, 1, device=device)
-    weight = Variable(torch.ones(bsz, 1, device=device))
+    
+    # 初始化权重参数（使用零初始化，配合 softplus 输出约为 0.693）
+    weight = Variable(torch.zeros(bsz, 1, device=device))
     weight.requires_grad = True
-    feature_pool = torch.cat([cfeatures, prev_feat.detach()], dim=0)
+    
+    # 特征池化：对当前特征做 L2 归一化，提高协方差计算的稳定性
+    cfeatures_norm = F.normalize(cfeatures, p=2, dim=1)
+    prev_feat_norm = F.normalize(prev_feat, p=2, dim=1) if prev_feat.numel() > 0 else prev_feat
+    feature_pool = torch.cat([cfeatures_norm, prev_feat_norm.detach()], dim=0)
     weight_pool = torch.cat([weight, prev_w.detach()], dim=0) if prev_w.numel() else weight
-    optimizer_bl = torch.optim.SGD([weight], lr=cfg.get("lr", 0.1), momentum=cfg.get("momentum", 0.9))
+    
+    # 优化器设置
+    base_lr = cfg.get("lr", 0.1)
+    # 任务越多，学习率越保守
+    task_decay = cfg.get("task_lr_decay", 0.9) ** cur_task
+    optimizer_bl = torch.optim.SGD([weight], lr=base_lr * task_decay, momentum=cfg.get("momentum", 0.9))
+    
     inner_epochs = max(1, cfg.get("inner_epochs", 5))
-    norm_mode = cfg.get("norm", "softmax").lower()  # "softmax" | "sigmoid_mean"
-    clamp_ratio = float(cfg.get("clamp_ratio", 0.0))  # >0 生效
+    norm_mode = cfg.get("norm", "softplus").lower()  # "softmax" | "sigmoid_mean" | "softplus"
+    clamp_ratio = float(cfg.get("clamp_ratio", 2.0))
+    temperature = float(cfg.get("temperature", 1.0))
 
     for inner_epoch in range(inner_epochs):
         _set_balance_lr(optimizer_bl, inner_epoch, cfg, inner_epochs)
         optimizer_bl.zero_grad()
 
-        if norm_mode == "sigmoid_mean":
-            # 非竞争型：Sigmoid 后按均值=1归一化
-            cur_weight = torch.sigmoid(weight)
+        if norm_mode == "softplus":
+            # Softplus 归一化：输出非负，梯度不饱和
+            cur_weight = F.softplus(weight / temperature)
             cur_weight = cur_weight / (cur_weight.mean().detach() + 1e-8)
-            if clamp_ratio and clamp_ratio > 1.0:
+            if clamp_ratio > 1.0:
                 cur_weight = torch.clamp(cur_weight, 1.0 / clamp_ratio, clamp_ratio)
                 cur_weight = cur_weight / (cur_weight.mean().detach() + 1e-8)
 
-            pooled_weight = torch.sigmoid(weight_pool)
+            pooled_weight = F.softplus(weight_pool / temperature)
             pooled_weight = pooled_weight / (pooled_weight.mean().detach() + 1e-8)
-            if clamp_ratio and clamp_ratio > 1.0:
+            if clamp_ratio > 1.0:
+                pooled_weight = torch.clamp(pooled_weight, 1.0 / clamp_ratio, clamp_ratio)
+                pooled_weight = pooled_weight / (pooled_weight.mean().detach() + 1e-8)
+        elif norm_mode == "sigmoid_mean":
+            cur_weight = torch.sigmoid(weight / temperature)
+            cur_weight = cur_weight / (cur_weight.mean().detach() + 1e-8)
+            if clamp_ratio > 1.0:
+                cur_weight = torch.clamp(cur_weight, 1.0 / clamp_ratio, clamp_ratio)
+                cur_weight = cur_weight / (cur_weight.mean().detach() + 1e-8)
+
+            pooled_weight = torch.sigmoid(weight_pool / temperature)
+            pooled_weight = pooled_weight / (pooled_weight.mean().detach() + 1e-8)
+            if clamp_ratio > 1.0:
                 pooled_weight = torch.clamp(pooled_weight, 1.0 / clamp_ratio, clamp_ratio)
                 pooled_weight = pooled_weight / (pooled_weight.mean().detach() + 1e-8)
         else:
-            # 竞争型：Softmax，和为1
+            # Softmax 归一化（原版）
             softmax = nn.Softmax(dim=0)
-            cur_weight = softmax(weight)
-            pooled_weight = softmax(weight_pool)
+            cur_weight = softmax(weight / temperature)
+            pooled_weight = softmax(weight_pool / temperature)
 
+        # 计算去相关损失
         loss_b = lossb_expect(feature_pool, pooled_weight, num_f=cfg.get("num_fourier", 1), use_sum=cfg.get("use_sum", True))
-        if norm_mode == "sigmoid_mean":
-            # 让权重中心在1附近，抑制过大或过小
-            decay_pow = cfg.get("decay_pow", 2.0)
+        
+        # 正则化损失：根据归一化模式调整
+        decay_pow = cfg.get("decay_pow", 2.0)
+        if norm_mode in ["sigmoid_mean", "softplus"]:
+            # 让权重趋向于1，而非趋向于0
             loss_p = torch.sum((cur_weight - 1.0).pow(decay_pow))
         else:
-            loss_p = torch.sum(cur_weight.pow(cfg.get("decay_pow", 2.0)))
+            loss_p = torch.sum(cur_weight.pow(decay_pow))
 
+        # Lambda 缩放：考虑任务进度
         lambda_coef = cfg.get("lambda_coef", 70.0)
         decay_factor = cfg.get("lambda_decay_rate", 1.0) ** (global_epoch // max(1, cfg.get("lambda_decay_epoch", 5)))
-        lambda_scaled = max(cfg.get("min_lambda", 0.01), decay_factor) * lambda_coef
-        loss_g = loss_b / lambda_scaled + loss_p
+        # 任务越多，去相关约束越弱（保持可塑性）
+        task_lambda_scale = cfg.get("task_lambda_scale", 1.0) ** cur_task
+        lambda_scaled = max(cfg.get("min_lambda", 0.01), decay_factor) * lambda_coef * task_lambda_scale
+        
+        # 正则化权重：随任务增加而减弱
+        reg_weight = cfg.get("reg_weight", 0.1) * (cfg.get("reg_task_decay", 0.9) ** cur_task)
+        
+        loss_g = loss_b / lambda_scaled + reg_weight * loss_p
         if global_epoch == 0:
             loss_g = loss_g * cfg.get("first_step_cons", 1.0)
+        
         loss_g.backward(retain_graph=True)
         optimizer_bl.step()
         weight_pool = torch.cat([weight, prev_w.detach()], dim=0) if prev_w.numel() else weight
 
-    # 输出与缓存更新：按选择的归一化模式生成最终权重
-    if norm_mode == "sigmoid_mean":
-        final_weight = torch.sigmoid(weight.detach())
-        final_weight = final_weight / (final_weight.mean() + 1e-8)
-        if clamp_ratio and clamp_ratio > 1.0:
-            final_weight = torch.clamp(final_weight, 1.0 / clamp_ratio, clamp_ratio)
+    # 生成最终权重
+    with torch.no_grad():
+        if norm_mode == "softplus":
+            final_weight = F.softplus(weight / temperature)
             final_weight = final_weight / (final_weight.mean() + 1e-8)
-    else:
-        final_weight = nn.Softmax(dim=0)(weight.detach())
+            if clamp_ratio > 1.0:
+                final_weight = torch.clamp(final_weight, 1.0 / clamp_ratio, clamp_ratio)
+                final_weight = final_weight / (final_weight.mean() + 1e-8)
+        elif norm_mode == "sigmoid_mean":
+            final_weight = torch.sigmoid(weight / temperature)
+            final_weight = final_weight / (final_weight.mean() + 1e-8)
+            if clamp_ratio > 1.0:
+                final_weight = torch.clamp(final_weight, 1.0 / clamp_ratio, clamp_ratio)
+                final_weight = final_weight / (final_weight.mean() + 1e-8)
+        else:
+            final_weight = nn.Softmax(dim=0)(weight / temperature)
 
+    # 更新特征库（使用原始特征，非归一化版本）
     state.update_bank(cfeatures.detach(), final_weight.detach())
     if global_epoch == 0 and inner_iter < cfg.get("bootstrap_iters", 10):
         state.features[:bsz] = (state.features[:bsz] * inner_iter + cfeatures.detach()) / (inner_iter + 1)
